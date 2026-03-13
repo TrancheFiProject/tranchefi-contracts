@@ -35,7 +35,6 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     // ================================================================
 
     uint256 internal constant WAD = 1e18;
-    uint256 internal constant BPS = 10_000;
     uint256 internal constant USDC_DECIMALS = 1e6;
 
     // --- Roles ---
@@ -356,7 +355,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         req.shares = 0; // prevent double-claim
 
         TrancheToken token = req.isSenior ? sdcSenior : sdcJunior;
-        token.transfer(msg.sender, shares);
+        IERC20(address(token)).safeTransfer(msg.sender, shares);
 
         emit DepositClaimed(msg.sender, requestId, shares);
     }
@@ -486,7 +485,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         if (token.balanceOf(msg.sender) < shares) revert InsufficientShares();
 
         // Transfer shares to vault (held until fulfilled and claimed)
-        token.transferFrom(msg.sender, address(this), shares);
+        IERC20(address(token)).safeTransferFrom(msg.sender, address(this), shares);
 
         requestId = nextRequestId++;
         withdrawalRequests[requestId] = WithdrawalRequest({
@@ -1175,17 +1174,6 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     // ================================================================
     // RATIO, SHARES, TVL HELPERS
     // ================================================================
-
-    function _wouldBreakRatio(uint256 depositAmount, bool isSenior) internal view returns (bool) {
-        uint256 newSr = seniorNAV + (isSenior ? depositAmount : 0);
-        uint256 newJr = juniorNAV + (isSenior ? 0 : depositAmount);
-        uint256 total = newSr + newJr;
-        if (total == 0) return false;
-        // Allow bootstrapping: if either tranche is currently empty, skip ratio check
-        if (seniorNAV == 0 || juniorNAV == 0) return false;
-        uint256 ratio = Math.mulDiv(newSr, WAD, total);
-        return ratio < RATIO_MIN || ratio > RATIO_MAX;
-    }
 
     function _checkTVLCap(uint256 depositAmount) internal view {
         if (tvlCap > 0) {
