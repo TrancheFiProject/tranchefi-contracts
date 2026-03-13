@@ -477,6 +477,61 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     // ================================================================
 
     /**
+     * @notice Instant withdrawal from reserve. Burns shares, sends USDC immediately.
+     * @param shares Number of tranche token shares to redeem
+     * @param isSenior True for senior, false for junior
+     * @return usdcOut Amount of USDC sent
+     * @return queued True if request was queued instead of instant
+     */
+    function instantRedeem(uint256 shares, bool isSenior) external nonReentrant returns (uint256 usdcOut, bool queued) {
+        if (shares == 0) revert ZeroAmount();
+        TrancheToken token = isSenior ? sdcSenior : sdcJunior;
+        if (token.balanceOf(msg.sender) < shares) revert InsufficientShares();
+        uint256 nav = isSenior ? seniorNAV : juniorNAV;
+        uint256 supply = token.totalSupply();
+        if (supply == 0) revert ZeroAmount();
+        usdcOut = (shares * nav) / supply;
+        if (usdcOut <= usdcReserve) {
+            IERC20(address(token)).safeTransferFrom(msg.sender, address(this), shares);
+            token.burn(address(this), shares);
+            if (isSenior) {
+                seniorNAV = seniorNAV > usdcOut ? seniorNAV - usdcOut : 0;
+            } else {
+                juniorNAV = juniorNAV > usdcOut ? juniorNAV - usdcOut : 0;
+            }
+            usdcReserve -= usdcOut;
+            usdc.safeTransfer(msg.sender, usdcOut);
+            emit WithdrawalClaimed(msg.sender, 0, usdcOut);
+            return (usdcOut, false);
+        }
+        IERC20(address(token)).safeTransferFrom(msg.sender, address(this), shares);
+        uint256 requestId = nextRequestId++;
+        withdrawalRequests[requestId] = WithdrawalRequest({
+            user: msg.sender,
+            isSenior: isSenior,
+            shares: shares,
+            epoch: currentEpoch,
+            fulfilled: false,
+            usdcAmount: 0
+        });
+        if (isSenior) {
+            queuedSeniorShares += shares;
+        } else {
+            queuedJuniorShares += shares;
+        }
+        emit WithdrawalRequested(msg.sender, isSenior, shares, requestId);
+        return (0, true);
+    }
+
+    /**
+     * @notice Instant withdrawal from reserve. Burns shares, sends USDC immediately.
+     * @param shares Number of tranche token shares to redeem
+     * @param isSenior True for senior, false for junior
+     * @return usdcOut Amount of USDC sent
+     * @return queued True if request was queued instead of instant
+     */
+
+    /**
      * @notice Request withdrawal from a tranche. Enters epoch queue.
      * @param shares Number of tranche token shares to redeem
      * @param isSenior True for senior, false for junior
