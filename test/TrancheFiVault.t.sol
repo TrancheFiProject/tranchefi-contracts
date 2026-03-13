@@ -188,15 +188,12 @@ contract TrancheFiVaultV2Test is Test {
         assertGt(vault.sdcSenior().balanceOf(carol), 0, "carol got shares");
     }
 
-    function test_syncDeposit_blocked_afterBootstrap() public {
-        _deposit70_30(); // both tranches funded
-
-        // Sync deposit should revert now
+    function test_syncDeposit_ratioEnforced_afterBootstrap() public {
+        _deposit70_30();
         vm.prank(carol);
         usdc.approve(address(vault), type(uint256).max);
-
         vm.prank(carol);
-        vm.expectRevert("use requestDeposit");
+        vm.expectRevert(TrancheFiVault.RatioBroken.selector);
         vault.depositJunior(100_000e6);
     }
 

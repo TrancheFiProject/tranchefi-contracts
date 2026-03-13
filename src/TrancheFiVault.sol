@@ -423,9 +423,11 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     function depositSenior(uint256 assets) external nonReentrant whenNotPaused returns (uint256 shares) {
         if (isShutdown) revert VaultShutdown();
         if (assets == 0) revert ZeroAmount();
-        // Sync deposits only allowed during bootstrap
-        require(seniorNAV == 0 || juniorNAV == 0, "use requestDeposit");
-        _checkTVLCap(assets);
+        _checkTVLCapWithPending(assets);
+        // Ratio check: skip during bootstrap, enforce after
+        if (seniorNAV > 0 && juniorNAV > 0) {
+            if (_wouldBreakRatioWithPending(assets, true)) revert RatioBroken();
+        }
 
         usdc.safeTransferFrom(msg.sender, address(this), assets);
 
@@ -447,9 +449,11 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     function depositJunior(uint256 assets) external nonReentrant whenNotPaused returns (uint256 shares) {
         if (isShutdown) revert VaultShutdown();
         if (assets == 0) revert ZeroAmount();
-        // Sync deposits only allowed during bootstrap
-        require(seniorNAV == 0 || juniorNAV == 0, "use requestDeposit");
-        _checkTVLCap(assets);
+        _checkTVLCapWithPending(assets);
+        // Ratio check: skip during bootstrap, enforce after
+        if (seniorNAV > 0 && juniorNAV > 0) {
+            if (_wouldBreakRatioWithPending(assets, false)) revert RatioBroken();
+        }
 
         usdc.safeTransferFrom(msg.sender, address(this), assets);
 
