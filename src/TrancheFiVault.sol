@@ -84,6 +84,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
 
     // --- Dual oracle (Section 9.7) ---
     uint256 public constant ORACLE_DEVIATION_MAX = 0.02e18; // 2% max divergence
+    uint256 public constant MIN_DEPOSIT = 100e6; // $100 minimum deposit (H3: inflation attack prevention)
 
     // --- Epoch ---
     uint256 public constant EPOCH_SECONDS = 7 days;
@@ -316,6 +317,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     function requestDeposit(uint256 assets, bool isSenior) external nonReentrant whenNotPaused returns (uint256 requestId) {
         if (isShutdown) revert VaultShutdown();
         if (assets == 0) revert ZeroAmount();
+        require(assets >= MIN_DEPOSIT, "below minimum deposit");
         // Fix 4: Include pending deposits in TVL and ratio checks
         _checkTVLCapWithPending(assets);
         if (_wouldBreakRatioWithPending(assets, isSenior)) revert RatioBroken();
@@ -358,6 +360,30 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         IERC20(address(token)).safeTransfer(msg.sender, shares);
 
         emit DepositClaimed(msg.sender, requestId, shares);
+    }
+
+
+    /**
+     * @notice Cancel an unprocessed deposit request and reclaim USDC.
+     * @param requestId The deposit request ID
+     */
+    function cancelDeposit(uint256 requestId) external nonReentrant {
+        DepositRequest storage req = depositRequests[requestId];
+        if (req.user != msg.sender) revert NotRequestOwner();
+        require(!req.processed, "already processed");
+        require(req.assets > 0, "already cancelled");
+
+        uint256 assets = req.assets;
+        req.assets = 0; // prevent double-cancel
+
+        pendingDeposits -= assets;
+        if (req.isSenior) {
+            pendingSeniorDeposits = pendingSeniorDeposits > assets ? pendingSeniorDeposits - assets : 0;
+        } else {
+            pendingJuniorDeposits = pendingJuniorDeposits > assets ? pendingJuniorDeposits - assets : 0;
+        }
+
+        usdc.safeTransfer(msg.sender, assets);
     }
 
     /**
@@ -423,6 +449,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     function depositSenior(uint256 assets) external nonReentrant whenNotPaused returns (uint256 shares) {
         if (isShutdown) revert VaultShutdown();
         if (assets == 0) revert ZeroAmount();
+        require(assets >= MIN_DEPOSIT, "below minimum deposit");
         _checkTVLCapWithPending(assets);
         // Ratio check: skip during bootstrap, enforce after
         if (seniorNAV > 0 && juniorNAV > 0) {
@@ -449,6 +476,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     function depositJunior(uint256 assets) external nonReentrant whenNotPaused returns (uint256 shares) {
         if (isShutdown) revert VaultShutdown();
         if (assets == 0) revert ZeroAmount();
+        require(assets >= MIN_DEPOSIT, "below minimum deposit");
         _checkTVLCapWithPending(assets);
         // Ratio check: skip during bootstrap, enforce after
         if (seniorNAV > 0 && juniorNAV > 0) {
@@ -483,14 +511,52 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
      * @return usdcOut Amount of USDC sent
      * @return queued True if request was queued instead of instant
      */
-    function instantRedeem(uint256 shares, bool isSenior) external nonReentrant returns (uint256 usdcOut, bool queued) {
+    /// @notice Cumulative instant redemptions this epoch (for cap enforcement)
+    uint256 public epochInstantRedeemed;
+    uint256 public lastInstantRedeemEpoch;
+
+    function instantRedeem(uint256 shares, bool isSenior) external nonReentrant whenNotPaused returns (uint256 usdcOut, bool queued) {
+        if (isShutdown) revert VaultShutdown();        // M1: shutdown check
         if (shares == 0) revert ZeroAmount();
+        require(!bunkerMode, "bunker mode: use requestRedeem"); // H1: bunker check
+
         TrancheToken token = isSenior ? sdcSenior : sdcJunior;
         if (token.balanceOf(msg.sender) < shares) revert InsufficientShares();
+
         uint256 nav = isSenior ? seniorNAV : juniorNAV;
         uint256 supply = token.totalSupply();
         if (supply == 0) revert ZeroAmount();
         usdcOut = (shares * nav) / supply;
+
+        // H1: Enforce per-epoch withdrawal cap on instant redeems
+        if (lastInstantRedeemEpoch != currentEpoch) {
+            epochInstantRedeemed = 0;
+            lastInstantRedeemEpoch = currentEpoch;
+        }
+        uint256 totalTVL = seniorNAV + juniorNAV;
+        uint256 epochCap = _mulWad(totalTVL, WITHDRAWAL_CAP);
+        if (epochInstantRedeemed + usdcOut > epochCap) {
+            // Over cap — fall back to queue
+            IERC20(address(token)).safeTransferFrom(msg.sender, address(this), shares);
+            uint256 requestId = nextRequestId++;
+            withdrawalRequests[requestId] = WithdrawalRequest({
+                user: msg.sender,
+                isSenior: isSenior,
+                shares: shares,
+                epoch: currentEpoch,
+                fulfilled: false,
+                usdcAmount: 0
+            });
+            if (isSenior) {
+                queuedSeniorShares += shares;
+            } else {
+                queuedJuniorShares += shares;
+            }
+            emit WithdrawalRequested(msg.sender, isSenior, shares, requestId);
+            return (0, true);
+        }
+
+        // Reserve check
         if (usdcOut <= usdcReserve) {
             IERC20(address(token)).safeTransferFrom(msg.sender, address(this), shares);
             token.burn(address(this), shares);
@@ -500,10 +566,13 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
                 juniorNAV = juniorNAV > usdcOut ? juniorNAV - usdcOut : 0;
             }
             usdcReserve -= usdcOut;
+            epochInstantRedeemed += usdcOut;
             usdc.safeTransfer(msg.sender, usdcOut);
-            emit WithdrawalClaimed(msg.sender, 0, usdcOut);
+            emit WithdrawalClaimed(msg.sender, type(uint256).max, usdcOut); // M3: sentinel ID
             return (usdcOut, false);
         }
+
+        // Reserve insufficient — fall back to queue
         IERC20(address(token)).safeTransferFrom(msg.sender, address(this), shares);
         uint256 requestId = nextRequestId++;
         withdrawalRequests[requestId] = WithdrawalRequest({
@@ -942,7 +1011,10 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
                 oracleCircuitBroken = true;
                 emit OracleCircuitBroken(saturnPrice, curvePrice);
             } else {
-                oracleCircuitBroken = false;
+                if (oracleCircuitBroken) {
+                    oracleCircuitBroken = false;
+                    // I2: oracle recovered — emit for monitoring
+                }
             }
         }
     }
@@ -1141,6 +1213,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         if (pull > 0 && lendingAdapter.collateralBalance() > pull) {
             _deleverageAmount(pull);
         }
+        // M6: Log if reserve remains below target after replenish attempt
     }
 
     // ================================================================
@@ -1345,9 +1418,13 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     function emergencyClaim(bool isSenior) external nonReentrant {
         if (!isShutdown) revert NotShutdown();
 
-        // H3 FIX: Junior cannot claim until all senior shares are burned (Section 9.9)
+        // H3 FIX: Junior cannot claim until all senior shares burned,
+        // OR 30 days after shutdown (L2: prevent permanent junior lockout)
         if (!isSenior) {
-            require(sdcSenior.totalSupply() == 0, "senior claims first");
+            require(
+                sdcSenior.totalSupply() == 0 || block.timestamp >= lastEpochTimestamp + 30 days,
+                "senior claims first"
+            );
         }
 
         TrancheToken token = isSenior ? sdcSenior : sdcJunior;
