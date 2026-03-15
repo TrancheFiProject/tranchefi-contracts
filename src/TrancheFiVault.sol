@@ -608,6 +608,26 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
      * @param isSenior True for senior, false for junior
      * @return requestId Unique ID for this withdrawal request
      */
+    /**
+     * @notice Cancel an unfulfilled withdrawal request and reclaim shares.
+     * @param requestId The withdrawal request ID
+     */
+    function cancelRedeem(uint256 requestId) external nonReentrant {
+        WithdrawalRequest storage req = withdrawalRequests[requestId];
+        if (req.user != msg.sender) revert NotRequestOwner();
+        require(!req.fulfilled, "already fulfilled");
+        require(req.shares > 0, "already cancelled");
+        uint256 shares = req.shares;
+        req.shares = 0;
+        if (req.isSenior) {
+            queuedSeniorShares -= shares;
+        } else {
+            queuedJuniorShares -= shares;
+        }
+        TrancheToken token = req.isSenior ? sdcSenior : sdcJunior;
+        IERC20(address(token)).safeTransfer(msg.sender, shares);
+    }
+
     function requestRedeem(uint256 shares, bool isSenior) external nonReentrant whenNotPaused returns (uint256 requestId) {
         if (shares == 0) revert ZeroAmount();
 
