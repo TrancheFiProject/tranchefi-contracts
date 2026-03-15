@@ -206,7 +206,9 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
 
     // --- Queue cursors (H5/M3 fix: avoid O(n) full scan) ---
     uint256 public lastProcessedDepositId;
-    uint256 public lastProcessedWithdrawalId;
+    uint256 public lastProcessedSeniorWithdrawalId;
+    uint256 public lastProcessedJuniorWithdrawalId;
+    uint256 public constant MAX_WITHDRAWAL_ITERATIONS = 50;
 
     // ================================================================
     // STRUCTS
@@ -733,11 +735,11 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         uint256 processedValue;
 
         // Advance cursor past fulfilled entries first
-        while (lastProcessedWithdrawalId < nextRequestId && withdrawalRequests[lastProcessedWithdrawalId].fulfilled) {
-            lastProcessedWithdrawalId++;
+        while (lastProcessedSeniorWithdrawalId < nextRequestId && withdrawalRequests[lastProcessedSeniorWithdrawalId].fulfilled) {
+            lastProcessedSeniorWithdrawalId++;
         }
 
-        for (uint256 i = lastProcessedWithdrawalId; i < nextRequestId; i++) {
+        for (uint256 i = lastProcessedSeniorWithdrawalId; i < nextRequestId; i++) {
             WithdrawalRequest storage req = withdrawalRequests[i];
             if (req.fulfilled || req.isSenior != isSenior || req.shares == 0) continue;
 
@@ -785,9 +787,21 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
             emit WithdrawalFulfilled(i, usdcOut);
         }
 
-        // Advance cursor past everything fulfilled
-        while (lastProcessedWithdrawalId < nextRequestId && withdrawalRequests[lastProcessedWithdrawalId].fulfilled) {
-            lastProcessedWithdrawalId++;
+        // Advance per-tranche cursor
+        if (isSenior) {
+            while (lastProcessedSeniorWithdrawalId < nextRequestId && 
+                   (withdrawalRequests[lastProcessedSeniorWithdrawalId].fulfilled || 
+                    withdrawalRequests[lastProcessedSeniorWithdrawalId].shares == 0 ||
+                    withdrawalRequests[lastProcessedSeniorWithdrawalId].isSenior != true)) {
+                lastProcessedSeniorWithdrawalId++;
+            }
+        } else {
+            while (lastProcessedJuniorWithdrawalId < nextRequestId && 
+                   (withdrawalRequests[lastProcessedJuniorWithdrawalId].fulfilled || 
+                    withdrawalRequests[lastProcessedJuniorWithdrawalId].shares == 0 ||
+                    withdrawalRequests[lastProcessedJuniorWithdrawalId].isSenior != false)) {
+                lastProcessedJuniorWithdrawalId++;
+            }
         }
     }
 
