@@ -647,12 +647,17 @@ contract TrancheFiVaultV2Test is Test {
         vault.settleEpoch(_stressSignals());
         oracle.setPrice(100e8); // reset for calm epochs
 
-        // Then 2 more calm
-        for (uint256 i = 0; i < 2; i++) {
-            vm.warp(block.timestamp + 100 days);
-            vm.prank(keeper);
-            vault.settleEpoch(_calmSignals());
-        }
+        // Then 2 more calm — prevStrcPrice must match last settled (96e8 after stress)
+        vm.warp(block.timestamp + 100 days);
+        vm.prank(keeper);
+        vault.settleEpoch(TrancheFiVault.SignalData({
+            borrowRate: 0.07e18,
+            strcPrice: 100e8,
+            prevStrcPrice: 96e8   // matches stored price from stress epoch
+        }));
+        vm.warp(block.timestamp + 100 days);
+        vm.prank(keeper);
+        vault.settleEpoch(_calmSignals()); // now lastSettled is 100e8, _calmSignals matches
 
         assertEq(vault.currentEpoch(), 7, "7 epochs settled");
         assertGt(vault.seniorNAV(), srStart, "senior grew overall");

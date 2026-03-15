@@ -153,6 +153,8 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
 
     // --- Oracle state ---
     bool public oracleCircuitBroken;
+    /// @notice Last settled STRC price, stored on-chain for prevStrcPrice validation (H-04)
+    uint256 public lastSettledStrcPrice;
 
     // ================================================================
     // WITHDRAWAL QUEUE (Section 9.3)
@@ -606,7 +608,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
      * @param isSenior True for senior, false for junior
      * @return requestId Unique ID for this withdrawal request
      */
-    function requestRedeem(uint256 shares, bool isSenior) external nonReentrant returns (uint256 requestId) {
+    function requestRedeem(uint256 shares, bool isSenior) external nonReentrant whenNotPaused returns (uint256 requestId) {
         if (shares == 0) revert ZeroAmount();
 
         TrancheToken token = isSenior ? sdcSenior : sdcJunior;
@@ -870,7 +872,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
             usdcFreed = _susdatToUsdc(unwindAmount);
 
             // Repay proportional debt
-            uint256 debtPortion = _mulWad(usdcFreed, currentLeverage - WAD) / currentLeverage;
+            uint256 debtPortion = Math.mulDiv(usdcFreed, currentLeverage - WAD, currentLeverage);
             uint256 debt = lendingAdapter.debtBalance();
             uint256 repay = debtPortion > debt ? debt : debtPortion;
 
@@ -927,11 +929,11 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         uint256 hf = lendingAdapter.healthFactor();
 
         if (hf < HF_EMERGENCY) {
-            // Tier 5: Emergency — deleverage THEN shut down (Fix 2)
-            _emergencyDeleverage(WAD); // repay all debt first
-            _convertRemainingToUsdc();  // convert sUSDat collateral to USDC
+            // M-05 FIX: Set shutdown FIRST to prevent TOCTOU race
             isShutdown = true;
             _pause();
+            _emergencyDeleverage(WAD);
+            _convertRemainingToUsdc();
             emit EmergencyShutdown(block.timestamp);
             return;
         }
@@ -975,15 +977,32 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
      *      Fix 2: Ensures assets are actually claimable after shutdown.
      */
     function _convertRemainingToUsdc() internal {
-        // Withdraw any remaining collateral from adapter
+        // H-02 FIX: Repay any remaining debt before withdrawing all collateral
+        uint256 debt = lendingAdapter.debtBalance();
+        if (debt > 0) {
+            uint256 vaultUsdc = usdc.balanceOf(address(this));
+            uint256 repayAmt = debt > vaultUsdc ? vaultUsdc : debt;
+            if (repayAmt > 0) {
+                usdc.forceApprove(address(lendingAdapter), repayAmt);
+                lendingAdapter.repay(repayAmt);
+            }
+        }
+        // Now withdraw remaining collateral safely
         uint256 remaining = lendingAdapter.collateralBalance();
         if (remaining > 0) {
             lendingAdapter.withdrawCollateral(remaining);
-            // Convert sUSDat to USDC via Curve
             uint256 usdcReceived = _susdatToUsdc(remaining);
+            // If debt remains, repay from swap proceeds
+            uint256 remainingDebt = lendingAdapter.debtBalance();
+            if (remainingDebt > 0 && usdcReceived > 0) {
+                uint256 repay2 = remainingDebt > usdcReceived ? usdcReceived : remainingDebt;
+                usdc.forceApprove(address(lendingAdapter), repay2);
+                lendingAdapter.repay(repay2);
+                usdcReceived -= repay2;
+            }
             usdcReserve += usdcReceived;
         }
-        currentLeverage = WAD; // 1.0x, no position
+        currentLeverage = WAD;
     }
 
     // ================================================================
@@ -1046,7 +1065,9 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         uint256 newLeverage = TARGET_LEVERAGE;
 
         // --- 3. Borrow cost circuit breaker ---
-        uint256 borrowRate = signals.borrowRate > 0 ? signals.borrowRate : DEFAULT_BORROW;
+        // M-03 FIX: Read borrow rate from adapter, not keeper-supplied data
+        uint256 borrowRate = lendingAdapter.currentBorrowRate();
+        if (borrowRate == 0) borrowRate = DEFAULT_BORROW;
         if (borrowRate >= BORROW_EMERGENCY) {
             newLeverage = WAD;
             canAdjustLeverage = true;
@@ -1123,6 +1144,10 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
             require(deviation <= 0.01e18, "STRC price mismatch vs oracle");
         }
 
+        // H-04 FIX: Validate prevStrcPrice against on-chain stored value
+        if (lastSettledStrcPrice > 0) {
+            require(signals.prevStrcPrice == lastSettledStrcPrice, "prevStrcPrice mismatch");
+        }
         int256 strcReturn = 0;
         if (signals.prevStrcPrice > 0) {
             strcReturn = (int256(signals.strcPrice) - int256(signals.prevStrcPrice))
@@ -1185,6 +1210,9 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
                 currentLeverage = WAD;
             }
         }
+
+        // H-04: Store current STRC price for next epoch validation
+        lastSettledStrcPrice = signals.strcPrice;
 
         emit EpochSettled(currentEpoch, seniorNAV, juniorNAV, currentLeverage, hf);
         emit WaterfallExecuted(currentEpoch, wf);
@@ -1438,7 +1466,9 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         uint256 usdcOwed = Math.mulDiv(userShares, nav, supply);
 
         // Cap at available USDC
-        uint256 available = usdc.balanceOf(address(this));
+        // M-01 FIX: Exclude pending depositors' USDC from claimable pool
+        uint256 rawBalance = usdc.balanceOf(address(this));
+        uint256 available = rawBalance > pendingDeposits ? rawBalance - pendingDeposits : 0;
         if (usdcOwed > available) usdcOwed = available;
 
         // Burn shares
