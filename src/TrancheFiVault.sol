@@ -734,12 +734,11 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     ) internal returns (uint256 totalDistributed) {
         uint256 processedValue;
 
-        // Advance cursor past fulfilled entries first
-        while (lastProcessedSeniorWithdrawalId < nextRequestId && withdrawalRequests[lastProcessedSeniorWithdrawalId].fulfilled) {
-            lastProcessedSeniorWithdrawalId++;
-        }
-
-        for (uint256 i = lastProcessedSeniorWithdrawalId; i < nextRequestId; i++) {
+        // Use per-tranche cursor (H-03 fix)
+        uint256 cursor = isSenior ? lastProcessedSeniorWithdrawalId : lastProcessedJuniorWithdrawalId;
+        uint256 iterations;
+        for (uint256 i = cursor; i < nextRequestId && iterations < MAX_WITHDRAWAL_ITERATIONS; i++) {
+            iterations++;
             WithdrawalRequest storage req = withdrawalRequests[i];
             if (req.fulfilled || req.isSenior != isSenior || req.shares == 0) continue;
 

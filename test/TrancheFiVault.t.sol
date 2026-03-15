@@ -919,4 +919,77 @@ contract TrancheFiVaultV2Test is Test {
         vault.depositSenior(50e6);
     }
 
+
+
+    // ================================================================
+    // FULL LIFECYCLE TEST
+    // ================================================================
+
+    function test_fullLifecycle() public {
+        _deposit70_30();
+
+        // Epoch 1: calm
+        vm.warp(block.timestamp + 100 days);
+        vm.prank(keeper);
+        vault.settleEpoch(_calmSignals());
+        assertGt(vault.seniorNAV(), 700_000e6, "senior grew");
+
+        // Epoch 2: calm
+        vm.warp(block.timestamp + 100 days);
+        vm.prank(keeper);
+        vault.settleEpoch(TrancheFiVault.SignalData(0.07e18, 100e8, 100e8));
+
+        // Alice instant redeems 2% senior
+        uint256 redeemAmt = vault.sdcSenior().balanceOf(alice) / 50;
+        vm.startPrank(alice);
+        vault.sdcSenior().approve(address(vault), type(uint256).max);
+        (uint256 out, bool q) = vault.instantRedeem(redeemAmt, true);
+        vm.stopPrank();
+        assertFalse(q, "instant from reserve");
+        assertGt(out, 0, "alice got USDC");
+
+        // Epoch 3: stress -4%
+        vm.warp(block.timestamp + 100 days);
+        oracle.setPrice(96e8);
+        vm.prank(keeper);
+        vault.settleEpoch(TrancheFiVault.SignalData(0.07e18, 96e8, 100e8));
+        oracle.setPrice(100e8);
+
+        // Bob queues 2% junior withdrawal
+        uint256 bobRedeem = vault.sdcJunior().balanceOf(bob) / 50;
+        vm.startPrank(bob);
+        vault.sdcJunior().approve(address(vault), type(uint256).max);
+        uint256 wdId = vault.requestRedeem(bobRedeem, false);
+        vm.stopPrank();
+
+        // Epoch 4: recovery
+        vm.warp(block.timestamp + 100 days);
+        vm.prank(keeper);
+        vault.settleEpoch(TrancheFiVault.SignalData(0.07e18, 100e8, 96e8));
+        vm.prank(bob);
+        vault.claimWithdrawal(wdId);
+        assertGt(usdc.balanceOf(bob), 0, "bob got USDC");
+
+        // Carol deposits senior then cancels
+        vm.prank(carol);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(carol);
+        uint256 depId = vault.requestDeposit(1_000e6, true);
+        uint256 carolBal = usdc.balanceOf(carol);
+        vm.prank(carol);
+        vault.cancelDeposit(depId);
+        assertEq(usdc.balanceOf(carol), carolBal + 1_000e6, "carol refunded");
+
+        // Epochs 5-7: calm
+        for (uint256 i = 0; i < 3; i++) {
+            vm.warp(block.timestamp + 100 days);
+            vm.prank(keeper);
+            vault.settleEpoch(TrancheFiVault.SignalData(0.07e18, 100e8, 100e8));
+        }
+
+        assertEq(vault.currentEpoch(), 7, "7 epochs");
+        assertGt(vault.seniorNAV(), 0, "senior alive");
+        assertGt(vault.juniorNAV(), 0, "junior alive");
+        assertGt(vault.accruedFees(), 0, "fees collected");
+    }
 }
