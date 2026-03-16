@@ -1488,7 +1488,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     }
 
     function canSettle() external view returns (bool) {
-        return block.timestamp >= lastEpochTimestamp + EPOCH_SECONDS - 1 hours;
+        return block.timestamp >= lastEpochTimestamp + EPOCH_SECONDS - 10 minutes;
     }
 
     /// @notice Get on-chain health factor from lending adapter
