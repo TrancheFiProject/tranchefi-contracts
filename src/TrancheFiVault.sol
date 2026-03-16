@@ -44,6 +44,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     // --- Senior tranche (Section 5) ---
     uint256 public constant SR_GROSS_APY = 0.085e18;
     uint256 public constant SR_MGMT_FEE  = 0.005e18;
+    uint256 public constant SR_NET_APY   = 0.08e18;  // 8% net for live accrual calc
 
     // --- Junior tranche (Section 8) ---
     uint256 public constant JR_MGMT_FEE  = 0.005e18;
@@ -139,6 +140,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     uint256 public lastEpochTimestamp;
     uint256 public accruedFees;
     bool public isShutdown;
+    uint256 public shutdownTimestamp; // E-10: precise shutdown time for junior fallback
 
     // --- USDC Reserve (Section 10.1) ---
     /// @notice USDC held in reserve (not looped), for instant withdrawals
@@ -518,16 +520,20 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
     /// @notice Cumulative instant redemptions this epoch (for cap enforcement)
     uint256 public epochInstantRedeemed;
     uint256 public lastInstantRedeemEpoch;
+    /// @notice E-03: Track last epoch a user cancelled a redeem (block cancel->instant arbitrage)
+    mapping(address => uint256) public lastCancelRedeemEpoch;
 
     function instantRedeem(uint256 shares, bool isSenior) external nonReentrant whenNotPaused returns (uint256 usdcOut, bool queued) {
         if (isShutdown) revert VaultShutdown();        // M1: shutdown check
         if (shares == 0) revert ZeroAmount();
         require(!bunkerMode, "bunker mode: use requestRedeem"); // H1: bunker check
+        require(lastCancelRedeemEpoch[msg.sender] != currentEpoch, "E-03: wait for next epoch after cancel"); // E-03
 
         TrancheToken token = isSenior ? sdcSenior : sdcJunior;
         if (token.balanceOf(msg.sender) < shares) revert InsufficientShares();
 
-        uint256 nav = isSenior ? seniorNAV : juniorNAV;
+        // E-01 FIX: Use live NAV (real-time adapter + oracle) not stale epoch NAV
+        uint256 nav = isSenior ? _liveSeniorNAV() : _liveJuniorNAV();
         uint256 supply = token.totalSupply();
         if (supply == 0) revert ZeroAmount();
         usdcOut = (shares * nav) / supply;
@@ -572,7 +578,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
             usdcReserve -= usdcOut;
             epochInstantRedeemed += usdcOut;
             usdc.safeTransfer(msg.sender, usdcOut);
-            emit WithdrawalClaimed(msg.sender, type(uint256).max, usdcOut); // M3: sentinel ID
+            emit WithdrawalClaimed(msg.sender, type(uint256).max, usdcOut);
             return (usdcOut, false);
         }
 
@@ -619,6 +625,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         if (req.user != msg.sender) revert NotRequestOwner();
         require(!req.fulfilled, "already fulfilled");
         require(req.shares > 0, "already cancelled");
+        lastCancelRedeemEpoch[msg.sender] = currentEpoch; // E-03: prevent cancel->instant arbitrage
         uint256 shares = req.shares;
         req.shares = 0;
         if (req.isSenior) {
@@ -626,8 +633,16 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         } else {
             queuedJuniorShares -= shares;
         }
+        // E-05: Cancel fee to prevent bunker mode griefing
+        // Fee = 0.1% of cancelled value, burned (reduces supply, benefits remaining holders)
         TrancheToken token = req.isSenior ? sdcSenior : sdcJunior;
-        IERC20(address(token)).safeTransfer(msg.sender, shares);
+        uint256 feeBps = 10; // 0.1%
+        uint256 feeShares = shares * feeBps / 10000;
+        uint256 returnShares = shares - feeShares;
+        if (feeShares > 0) {
+            token.burn(address(this), feeShares); // burned = value redistributed to remaining holders
+        }
+        IERC20(address(token)).safeTransfer(msg.sender, returnShares);
     }
 
     function requestRedeem(uint256 shares, bool isSenior) external nonReentrant whenNotPaused returns (uint256 requestId) {
@@ -774,12 +789,13 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
             TrancheToken token = isSenior ? sdcSenior : sdcJunior;
             token.burn(address(this), req.shares);
 
-            // A5 FIX: Reduce NAV by actual USDC paid out
+            // E-06 FIX: Reduce NAV by full asset value (not just USDC paid out)
+            // This socializes slippage loss immediately, preventing NAV overstatement
             if (isSenior) {
-                seniorNAV = seniorNAV > usdcOut ? seniorNAV - usdcOut : 0;
+                seniorNAV = seniorNAV > assetValue ? seniorNAV - assetValue : 0;
                 queuedSeniorShares -= req.shares;
             } else {
-                juniorNAV = juniorNAV > usdcOut ? juniorNAV - usdcOut : 0;
+                juniorNAV = juniorNAV > assetValue ? juniorNAV - assetValue : 0;
                 queuedJuniorShares -= req.shares;
             }
 
@@ -964,6 +980,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         if (hf < HF_EMERGENCY) {
             // M-05 FIX: Set shutdown FIRST to prevent TOCTOU race
             isShutdown = true;
+            shutdownTimestamp = block.timestamp; // E-10
             _pause();
             _emergencyDeleverage(WAD);
             _convertRemainingToUsdc();
@@ -1088,7 +1105,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
      */
     function settleEpoch(SignalData calldata signals) external onlyRole(KEEPER_ROLE) nonReentrant {
         if (isShutdown) revert VaultShutdown();
-        if (block.timestamp < lastEpochTimestamp + EPOCH_SECONDS - 1 hours) revert EpochTooSoon();
+        if (block.timestamp < lastEpochTimestamp + EPOCH_SECONDS - 10 minutes) revert EpochTooSoon();
 
         // --- 1. Dual oracle check ---
         _checkOracleDeviation();
@@ -1347,7 +1364,10 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         }
 
         wf.perfFee = jrGrossYield > 0 ? Math.mulDiv(jrGrossYield, JR_PERF_FEE, WAD) : 0;
-        wf.juniorMgmtFee = Math.mulDiv(jrNAV, JR_MGMT_FEE, EPOCHS_PER_YEAR * WAD);
+        // E-07 FIX: Waive junior mgmt fee during negative carry (matches senior treatment)
+        wf.juniorMgmtFee = poolYieldSigned > 0
+            ? Math.mulDiv(jrNAV, JR_MGMT_FEE, EPOCHS_PER_YEAR * WAD)
+            : 0;
 
         // Junior net delta = income residual - fees + MTM + negative carry (if any)
         int256 jrYieldNet = int256(jrGrossYield) - int256(wf.perfFee) - int256(wf.juniorMgmtFee);
@@ -1410,6 +1430,37 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         return Math.mulDiv(shares, nav, totalSupply);
     }
 
+
+    /// @notice Compute live total vault value from adapter position + reserve
+    /// @dev Used by instantRedeem for real-time pricing between epochs
+    function _liveTotalAssets() internal view returns (uint256) {
+        uint256 collateral = lendingAdapter.collateralBalance();
+        uint256 debt = lendingAdapter.debtBalance();
+        // sUSDat collateral valued via Saturn exchange rate
+        uint256 collateralUsdc = collateral > 0
+            ? Math.mulDiv(collateral, sUsdat.convertToAssets(WAD), WAD)
+            : 0;
+        uint256 totalAssets = usdcReserve + collateralUsdc;
+        return totalAssets > debt ? totalAssets - debt : 0;
+    }
+
+    /// @notice Live senior NAV: last settled + pro-rata coupon accrual since epoch
+    function _liveSeniorNAV() internal view returns (uint256) {
+        uint256 elapsed = block.timestamp - lastEpochTimestamp;
+        uint256 maxElapsed = EPOCH_SECONDS;
+        if (elapsed > maxElapsed) elapsed = maxElapsed;
+        // Pro-rata 8% annual coupon accrual
+        uint256 accrual = Math.mulDiv(seniorNAV, SR_NET_APY * elapsed, 365 days * WAD);
+        return seniorNAV + accrual;
+    }
+
+    /// @notice Live junior NAV: total live assets minus live senior NAV
+    function _liveJuniorNAV() internal view returns (uint256) {
+        uint256 totalLive = _liveTotalAssets();
+        uint256 srLive = _liveSeniorNAV();
+        return totalLive > srLive ? totalLive - srLive : 0;
+    }
+
     // ================================================================
     // VIEW FUNCTIONS
     // ================================================================
@@ -1463,6 +1514,7 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
 
     function emergencyShutdown() external onlyRole(GUARDIAN_ROLE) {
         isShutdown = true;
+        shutdownTimestamp = block.timestamp; // E-10
         _pause();
         // Fix 2: Full unwind — deleverage then convert all sUSDat to USDC
         _emergencyDeleverage(WAD);
@@ -1482,8 +1534,9 @@ contract TrancheFiVault is AccessControl, ReentrancyGuard, Pausable {
         // H3 FIX: Junior cannot claim until all senior shares burned,
         // OR 30 days after shutdown (L2: prevent permanent junior lockout)
         if (!isSenior) {
+            // E-10 FIX: Use actual shutdown time, not last epoch timestamp
             require(
-                sdcSenior.totalSupply() == 0 || block.timestamp >= lastEpochTimestamp + 30 days,
+                sdcSenior.totalSupply() == 0 || block.timestamp >= shutdownTimestamp + 30 days,
                 "senior claims first"
             );
         }
