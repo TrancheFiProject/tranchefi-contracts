@@ -144,13 +144,13 @@ contract VaultHandler is Test {
         vm.warp(block.timestamp + 100 days);
 
         // Random STRC price between $85 and $105
-        uint256 strcPrice = bound(priceSeed, 85e8, 105e8);
-        oracle.setPrice(strcPrice);
+        uint256 underlyingPrice = bound(priceSeed, 85e8, 105e8);
+        oracle.setPrice(underlyingPrice);
 
         TrancheFiVault.SignalData memory sig = TrancheFiVault.SignalData({
-            borrowRate: 0.07e18,
-            strcPrice: strcPrice,
-            prevStrcPrice: 100e8
+            // borrowRate: 0.07e18,
+            underlyingPrice: underlyingPrice,
+            prevUnderlyingPrice: 100e8
         });
 
         vm.prank(keeper);
@@ -166,13 +166,13 @@ contract VaultHandler is Test {
         vm.warp(block.timestamp + 100 days);
 
         // Stress: STRC between $80 and $95 (realistic single-epoch stress)
-        uint256 strcPrice = bound(priceSeed, 80e8, 95e8);
-        oracle.setPrice(strcPrice);
+        uint256 underlyingPrice = bound(priceSeed, 80e8, 95e8);
+        oracle.setPrice(underlyingPrice);
 
         TrancheFiVault.SignalData memory sig = TrancheFiVault.SignalData({
-            borrowRate: 0.12e18, // elevated borrow
-            strcPrice: strcPrice,
-            prevStrcPrice: 100e8
+            // borrowRate: 0.12e18, // elevated borrow
+            underlyingPrice: underlyingPrice,
+            prevUnderlyingPrice: 100e8
         });
 
         vm.prank(keeper);
@@ -238,9 +238,9 @@ contract TrancheFiInvariantTest is Test {
         vm.warp(block.timestamp + 100 days);
         vm.prank(keeper);
         vault.settleEpoch(TrancheFiVault.SignalData({
-            borrowRate: 0.07e18,
-            strcPrice: 100e8,
-            prevStrcPrice: 100e8
+            // borrowRate: 0.07e18,
+            underlyingPrice: 100e8,
+            prevUnderlyingPrice: 100e8
         }));
 
         // Create handler

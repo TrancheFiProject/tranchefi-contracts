@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {IStrcPriceOracle} from "../../src/interfaces/ISaturn.sol";
+import {IUnderlyingPriceOracle} from "../../src/interfaces/IVaultUnderlying.sol";
 
 /// @dev Mock STRC oracle returning configurable price (8 decimals).
-contract MockStrcOracle is IStrcPriceOracle {
+contract MockStrcOracle is IUnderlyingPriceOracle {
     uint256 public price = 100e8;  // $100.00 (at par)
     uint8 public constant DECIMALS = 8;
 
