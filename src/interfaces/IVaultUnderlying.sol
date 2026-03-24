@@ -63,7 +63,7 @@ interface IStakedUSDat is IERC4626 {
 }
 
 /// @notice STRC price oracle wrapping Chainlink with staleness + bounds checks.
-interface IStrcPriceOracle {
+interface IUnderlyingPriceOracle {
     /// @notice Get validated STRC price. Reverts if stale or out of bounds [$20, $150].
     /// @return price The STRC price (8 decimals on Chainlink).
     /// @return oracleDecimals The number of decimals in the price.
